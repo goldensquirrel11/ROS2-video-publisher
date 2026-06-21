@@ -1,3 +1,4 @@
+import yaml
 import rclpy
 from rclpy.node import Node
 import cv2 as cv
@@ -10,42 +11,105 @@ class VideoPublisher(Node):
     def __init__(self):
         super().__init__("video_publisher")
 
-        self.declare_parameter('video_file', '/home/golde/Downloads/output.mp4')
-        self.declare_parameter('publish_rate', 24.0)
+        self.declare_parameter('video_file', '')
+        self.declare_parameter('yaml_file', '')
+        self.declare_parameter('publish_rate', 1.0)
+        self.declare_parameter('loop_video', False)
 
-        self.declare_parameter('camera.fx', 520.90862)
-        self.declare_parameter('camera.fy', 521.007327)
-        self.declare_parameter('camera.cx', 325.141442)
-        self.declare_parameter('camera.cy', 249.701764)
-        self.declare_parameter('camera.k1', 0.2312)
-        self.declare_parameter('camera.k2', -0.7849)
-        self.declare_parameter('camera.p1', -0.0033)
-        self.declare_parameter('camera.p2', -0.0001)
-        self.declare_parameter('camera.k3', 0.9172)
-        self.declare_parameter('camera.width', 640)
-        self.declare_parameter('camera.height', 480)
-        self.declare_parameter('camera.distorted', True)
-
-        self.video_file = self.get_parameter('video_file').get_parameter_value().string_value
+        video_file = self.get_parameter('video_file').get_parameter_value().string_value
+        yaml_file = self.get_parameter('yaml_file').get_parameter_value().string_value
         self.publish_rate = self.get_parameter('publish_rate').get_parameter_value().double_value
-        self.fx = self.get_parameter('camera.fx').get_parameter_value().double_value
-        self.fy = self.get_parameter('camera.fy').get_parameter_value().double_value
-        self.cx = self.get_parameter('camera.cx').get_parameter_value().double_value
-        self.cy = self.get_parameter('camera.cy').get_parameter_value().double_value
-        self.k1 = self.get_parameter('camera.k1').get_parameter_value().double_value
-        self.k2 = self.get_parameter('camera.k2').get_parameter_value().double_value
-        self.p1 = self.get_parameter('camera.p1').get_parameter_value().double_value
-        self.p2 = self.get_parameter('camera.p2').get_parameter_value().double_value
-        self.k3 = self.get_parameter('camera.k3').get_parameter_value().double_value
-        self.width = int(self.get_parameter('camera.width').get_parameter_value().integer_value)
-        self.height = int(self.get_parameter('camera.height').get_parameter_value().integer_value)
-        self.distorted = self.get_parameter('camera.distorted').get_parameter_value().bool_value
+        self.loop_video = self.get_parameter('loop_video').get_parameter_value().bool_value
 
-        self.get_logger().info(f'Publish rate: {self.publish_rate}')
+        # Resolve paths
+        video_path = Path(video_file)
+        self.video_file = str(video_path)
 
-        if not Path(self.video_file).exists():
+        if not video_path.exists():
             self.get_logger().error(f'Video file does not exist: {self.video_file}')
             return
+
+        # Determine yaml path
+        yaml_path = None
+        if yaml_file:
+            yaml_path = Path(yaml_file)
+        else:
+            # Look for a yaml file in the same directory as the video file that has the same name
+            candidate_yaml = video_path.with_suffix('.yaml')
+            if candidate_yaml.exists():
+                yaml_path = candidate_yaml
+            else:
+                candidate_yml = video_path.with_suffix('.yml')
+                if candidate_yml.exists():
+                    yaml_path = candidate_yml
+
+        # Load camera parameters from yaml file if it exists
+        if yaml_path and yaml_path.exists():
+            self.get_logger().info(f"Loading camera parameters from YAML: {yaml_path}")
+            try:
+                with open(yaml_path, 'r') as f:
+                    yaml_data = yaml.safe_load(f)
+                
+                parsed_params = {}
+                if yaml_data:
+                    # Check Dataset -> Calibration
+                    if 'Dataset' in yaml_data and isinstance(yaml_data['Dataset'], dict) and 'Calibration' in yaml_data['Dataset']:
+                        parsed_params = yaml_data['Dataset']['Calibration']
+                    # Check camera nested
+                    elif 'camera' in yaml_data and isinstance(yaml_data['camera'], dict):
+                        parsed_params = yaml_data['camera']
+                    # Check standard ROS camera info
+                    elif 'camera_matrix' in yaml_data or 'projection_matrix' in yaml_data:
+                        if 'image_width' in yaml_data:
+                            self.width = int(yaml_data['image_width'])
+                        if 'image_height' in yaml_data:
+                            self.height = int(yaml_data['image_height'])
+                        if 'distortion_model' in yaml_data:
+                            self.distorted = (yaml_data['distortion_model'] != 'none')
+                        if 'camera_matrix' in yaml_data and isinstance(yaml_data['camera_matrix'], dict):
+                            cm = yaml_data['camera_matrix'].get('data', [])
+                            if len(cm) >= 9:
+                                self.fx, self.cx = float(cm[0]), float(cm[2])
+                                self.fy, self.cy = float(cm[4]), float(cm[5])
+                        if 'distortion_coefficients' in yaml_data and isinstance(yaml_data['distortion_coefficients'], dict):
+                            dc = yaml_data['distortion_coefficients'].get('data', [])
+                            if len(dc) >= 4:
+                                self.k1, self.k2, self.p1, self.p2 = float(dc[0]), float(dc[1]), float(dc[2]), float(dc[3])
+                            if len(dc) >= 5:
+                                self.k3 = float(dc[4])
+                    # Check flat dict
+                    elif isinstance(yaml_data, dict):
+                        parsed_params = yaml_data
+
+                    # Apply parsed_params if any
+                    for k, v in parsed_params.items():
+                        key_name = k.split('.')[-1]
+                        if key_name == 'fx': self.fx = float(v)
+                        elif key_name == 'fy': self.fy = float(v)
+                        elif key_name == 'cx': self.cx = float(v)
+                        elif key_name == 'cy': self.cy = float(v)
+                        elif key_name == 'k1': self.k1 = float(v)
+                        elif key_name == 'k2': self.k2 = float(v)
+                        elif key_name == 'p1': self.p1 = float(v)
+                        elif key_name == 'p2': self.p2 = float(v)
+                        elif key_name == 'k3': self.k3 = float(v)
+                        elif key_name == 'width': self.width = int(v)
+                        elif key_name == 'height': self.height = int(v)
+                        elif key_name == 'distorted': self.distorted = bool(v)
+            except Exception as e:
+                self.get_logger().error(f"Failed to parse camera yaml file: {str(e)}")
+        else:
+            if yaml_file:
+                self.get_logger().warning(f"Specified YAML file does not exist: {yaml_file}")
+            else:
+                self.get_logger().info("No YAML file specified or found in video directory. Using default camera parameters.")
+
+        self.get_logger().info(f'Publish rate: {self.publish_rate}')
+        self.get_logger().info(
+            f"Loaded camera parameters: fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}, "
+            f"k1={self.k1}, k2={self.k2}, p1={self.p1}, p2={self.p2}, k3={self.k3}, "
+            f"width={self.width}, height={self.height}, distorted={self.distorted}"
+        )
         
         self.cap = cv.VideoCapture(self.video_file)
         if not self.cap.isOpened():
@@ -100,9 +164,13 @@ class VideoPublisher(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to convert and publish frame: {str(e)}")
         else:
-            self.cap.set(cv.CAP_PROP_POS_FRAMES, 0)
-            self.frame_index = 0
-            self.get_logger().info("Reached end of video, looping back to start")
+            if self.loop_video:
+                self.cap.set(cv.CAP_PROP_POS_FRAMES, 0)
+                self.frame_index = 0
+                self.get_logger().info("Reached end of video, looping back to start")
+            else:
+                self.get_logger().info("Reached end of video. Stopping publisher.")
+                self.timer.cancel()
 
 def main(args=None):
     rclpy.init(args=args)
